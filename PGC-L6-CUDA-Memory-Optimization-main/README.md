@@ -1,69 +1,213 @@
-# Experiment 6 — Memory Optimization in CUDA
+# Experiment 6 --- Memory Optimization in CUDA
 
 ![CUDA](https://img.shields.io/badge/CUDA-13.4-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![GPU](https://img.shields.io/badge/GPU-RTX%203050%206GB%20(sm__86)-76B900?style=flat-square&logo=nvidia&logoColor=white)
+![GPU](https://img.shields.io/badge/GPU-RTX%205060%20Ti-76B900?style=flat-square&logo=nvidia&logoColor=white)
+![Architecture](https://img.shields.io/badge/Compute%20Capability-12.0%20%7C%20sm__120-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![Language](https://img.shields.io/badge/Language-CUDA%20C%2B%2B-00599C?style=flat-square&logo=cplusplus&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20MSVC-0078D6?style=flat-square&logo=windows&logoColor=white)
 
-## Overview
+A hands-on CUDA C++ experiment that explores how global-memory access
+patterns and shared-memory tiling affect GPU performance. The program
+compares two matrix-transpose implementations and measures a baseline
+matrix-multiplication kernel.
 
-This experiment benchmarks GPU global-memory access patterns and shared-memory optimization in CUDA C++ ([`exp6.cu`](exp6.cu)) across two workloads:
+------------------------------------------------------------------------
 
-1. **Matrix Transpose (`4096 x 4096` `float`)**: Compares a naive uncoalesced kernel (`transposeNaive`) against a shared-memory tiled coalesced kernel (`transposeCoalesced`).
-2. **Naive Matrix Multiplication (`1024 x 1024` `float`)**: Evaluates a baseline global-memory `matMulNaive` kernel ($C = A \times B$).
+## Contents
 
----
+-   [Objectives](#objectives)
+-   [Workloads and kernels](#workloads-and-kernels)
+-   [Hardware and software
+    environment](#hardware-and-software-environment)
+-   [Build and run](#build-and-run)
+-   [Benchmark results](#benchmark-results)
+-   [Concepts demonstrated](#concepts-demonstrated)
+-   [Project structure](#project-structure)
+-   [Execution screenshot](#execution-screenshot)
 
-## Hardware & Environment
+## Objectives
 
-| Component | Specification |
-| --- | --- |
-| **GPU** | NVIDIA GeForce RTX 3050 6GB Laptop GPU |
-| **Compute Capability** | 8.6 (`sm_86`, Ampere) |
-| **CUDA Toolkit** | 13.4 |
-| **OS & Toolchain** | Windows PowerShell + MSVC (`nvcc`) |
+-   Understand how CUDA threads access global memory.
+-   Compare coalesced and uncoalesced memory transactions.
+-   Use shared memory to reorganize data during matrix transpose.
+-   Understand shared-memory bank conflicts and padding.
+-   Measure kernel execution time and validate computed results.
 
----
+## Workloads and kernels
 
-## Benchmark Results
+### 1. Matrix transpose
 
-Measured with CUDA events after a warm-up launch (averaged over 20 runs for transpose and 5 runs for matrix multiplication):
+The transpose workload operates on an `N x N` matrix of `float` values.
 
-| Kernel / Workload | Matrix Size | Avg. Time | Speedup | Throughput | Verification |
-| --- | --- | --- | --- | --- | --- |
-| **Transpose (Uncoalesced)** | `N = 4096` | `2.704 ms` | `1.00x` (baseline) | `49.6 GB/s` | `PASS` |
-| **Transpose (Coalesced)** | `N = 4096` | `1.084 ms` | `2.49x` | `123.8 GB/s` | `PASS` |
-| **Naive Matrix Multiplication** | `N = 1024` | `4.466 ms` | — | `480.8 GFLOPS` | `PASS` |
+**Naive transpose --- `transposeNaive`**
 
----
+The baseline kernel reads matrix elements from global memory and writes
+them to transposed positions. With the usual 2D thread mapping, one side
+of the operation is contiguous across a warp while the other side is
+strided. This can produce inefficient global-memory transactions.
 
-## Key Takeaways
+**Shared-memory transpose --- `transposeCoalesced`**
 
-- **Coalesced Global Memory Access (`2.49x` Speedup)**:
-  - In `transposeNaive`, threads in a warp read `in[y * N + x]` contiguously (coalesced) but write `out[x * N + y]` with a stride of `N` floats. Each warp issues scattered memory transactions across cache lines, saturating memory-controller overhead and dropping effective bandwidth to `49.6 GB/s`.
-  - In `transposeCoalesced`, each `32 x 32` thread block stages a tile in on-chip `__shared__` memory: warps perform a coalesced row-wise read into `tile[threadIdx.y][threadIdx.x]`, synchronize via `__syncthreads()`, and then write `tile[threadIdx.x][threadIdx.y]` to transposed block coordinates `out[y * N + x]` so that consecutive `threadIdx.x` threads again write contiguous global addresses (`123.8 GB/s`).
-- **Bank-Conflict Elimination with `tile[32][33]`**:
-  - CUDA shared memory is divided into 32 banks (4-byte stride). With an unpadded `tile[32][32]`, reading column-wise (`tile[threadIdx.x][threadIdx.y]`) maps all 32 threads of a warp to the **same** memory bank, causing a 32-way bank conflict that serializes shared-memory reads.
-  - Adding `+1` column padding (`__shared__ float tile[TILE][TILE + 1]`, i.e., `tile[32][33]`) shifts each row by one bank, mapping consecutive column elements across all 32 distinct banks and eliminating bank conflicts completely.
-- **Why Naive MatMul Remains Global-Memory Bound**:
-  - In `matMulNaive` (`16 x 16` thread blocks), every thread computes one element of `C` by iterating `k = 0 .. N-1` and reading `A[row * N + k]` and `B[k * N + col]` directly from global memory.
-  - Each `float` load from `A` and `B` is used for only a single FMA (`2` FLOPs per `8` bytes loaded, an arithmetic intensity of `0.25 FLOP/byte`), leaving the SMs stalled on DRAM/L2 latency and bandwidth (`480.8 GFLOPS`) rather than compute throughput—motivating shared-memory tiled matrix multiplication in subsequent optimizations.
+The optimized kernel uses a `32 x 32` tile in shared memory to rearrange
+elements before writing the transposed tile to global memory. The padded
+declaration:
 
----
-
-## Build & Run
-
-Compile and run from PowerShell (with the MSVC / CUDA environment configured):
-
-```powershell
-nvcc -O2 -arch=sm_86 -o exp6.exe exp6.cu
-.\exp6.exe
+``` cpp
+__shared__ float tile[32][33];
 ```
 
-Optional CLI arguments override matrix sizes (`.\exp6.exe <N_transpose> <N_matmul>`), defaulting to `4096` and `1024`.
+adds one extra column to the tile. This padding helps avoid the
+shared-memory bank conflicts that can occur when a warp accesses a
+column of a `32 x 32` tile.
 
----
+### 2. Naive matrix multiplication
 
-## Execution Output
+The `matMulNaive` kernel computes:
 
-![PowerShell Output](C:\Users\user\Pictures\Screenshots\Screenshot 2026-11-17 103424.png)
+\[ C = A `\times `{=tex}B \]
+
+Each CUDA thread computes one output element by accumulating products
+across the inner dimension. This is a baseline implementation that
+accesses input matrices from global memory. It is useful for comparison
+with more advanced tiled matrix-multiplication approaches.
+
+## Hardware and software environment
+
+  Component              Specification
+  ---------------------- ------------------------------------------------
+  GPU                    NVIDIA GeForce RTX 5060 Ti
+  Compute capability     12.0 (`sm_120`, Blackwell architecture)
+  CUDA Toolkit           13.4
+  Programming language   CUDA C++
+  Operating system       Windows
+  Compiler toolchain     NVIDIA `nvcc` with Microsoft Visual C++ (MSVC)
+
+> **Note:** Record the exact driver version from `nvidia-smi` when
+> documenting your final run. Benchmark results depend on the GPU,
+> driver, clock state, power limit, matrix size, and system conditions.
+
+## Build and run
+
+Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or a
+terminal where both MSVC and CUDA are available), then change to the
+project directory.
+
+Compile for the RTX 5060 Ti:
+
+``` cmd
+nvcc -O2 -arch=compute_120 -code=sm_120 -o exp6.exe exp6.cu
+```
+
+Run with the default matrix sizes:
+
+``` cmd
+exp6.exe
+```
+
+Or provide custom sizes:
+
+``` cmd
+exp6.exe 2048 512
+```
+
+The optional arguments are:
+
+``` text
+exp6.exe <N_transpose> <N_matmul>
+```
+
+-   `N_transpose`: dimension of the square matrix used for transpose.
+-   `N_matmul`: dimension of the square matrices used for
+    multiplication.
+
+For example, `exp6.exe 2048 512` runs transpose on a `2048 x 2048`
+matrix and matrix multiplication on `512 x 512` matrices, if the program
+accepts these arguments as implemented in `exp6.cu`.
+
+## Benchmark results
+
+**Fill this table using the measurements printed by your own successful
+run.** Do not copy results from another GPU or from a sample repository.
+
+  --------------------------------------------------------------------------------------
+  Kernel /          Matrix size Average time      Speedup      Throughput Verification
+  workload                                                                
+  ---------------- ------------ ------------ ------------ --------------- --------------
+  Transpose ---      `N = ____`    `____ ms`      `1.00x`     `____ GB/s` `PASS/FAIL`
+  naive /                                      (baseline)                 
+  uncoalesced                                                             
+
+  Transpose ---      `N = ____`    `____ ms`      `____x`     `____ GB/s` `PASS/FAIL`
+  shared-memory /                                                         
+  coalesced                                                               
+
+  Matrix             `N = ____`    `____ ms`          ---   `____ GFLOPS` `PASS/FAIL`
+  multiplication                                                          
+  --- naive                                                               
+  --------------------------------------------------------------------------------------
+
+### How to interpret the measurements
+
+-   **Speedup** compares the naive transpose time with the coalesced
+    transpose time.
+-   **Bandwidth** describes the effective data-transfer rate for the
+    transpose workload. Use the same calculation and byte-count
+    convention as the program.
+-   **GFLOPS** reports billions of floating-point operations per second
+    for matrix multiplication, based on the operation-count convention
+    used by the program.
+-   **Verification** indicates whether the GPU output passed the
+    program's correctness check.
+
+## Concepts demonstrated
+
+-   **Global-memory coalescing:** Threads in a warp achieve more
+    efficient memory transactions when their addresses are suitably
+    contiguous.
+-   **Shared-memory tiling:** A tile can be loaded in one access pattern
+    and read back in another, allowing a transpose to use coalesced
+    global-memory accesses on both sides.
+-   **Shared-memory bank conflicts:** Multiple threads accessing
+    different addresses in the same memory bank can cause conflicts.
+    Padding a `32 x 32` tile to `32 x 33` changes the row stride and
+    helps avoid the classic column-access conflict.
+-   **Kernel timing:** CUDA events can measure GPU execution time.
+    Warm-up launches and repeated measurements help produce more
+    representative timings.
+-   **Correctness checking:** Performance comparisons are meaningful
+    only when the output is also validated.
+
+## Project structure
+
+``` text
+PGC-L6-CUDA-Memory-Optimization/
+├── exp6.cu
+├── README.md
+├── .gitignore
+└── screenshots/
+    └── output.png
+```
+
+Keep the screenshot inside the repository and reference it using a
+relative path so it renders on GitHub.
+
+## Execution screenshot
+
+After a successful run, save a screenshot of the terminal output as
+`screenshots/output.png`.
+
+![Experiment 6 execution output](screenshots/output.png)
+
+If your screenshot has a different filename, update the image path above
+to match it.
+
+------------------------------------------------------------------------
+
+## Author / course information
+
+-   **Course:** Parallel and GPU Computing
+-   **Experiment:** 6 --- Memory Optimization in CUDA
+-   **Implementation:** CUDA C++
+
+Add your name, USN, class, and institution here if required by your lab
+submission guidelines.
