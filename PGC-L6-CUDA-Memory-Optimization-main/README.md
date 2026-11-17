@@ -66,4 +66,4 @@ Optional CLI arguments override matrix sizes (`.\exp6.exe <N_transpose> <N_matmu
 
 ## Execution Output
 
-![PowerShell Output](C:\Users\user\Pictures\Screenshots\Screenshot 2026-11-17 103424.png)
+![PowerShell Output](screenshots/output.png)
